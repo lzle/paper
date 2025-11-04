@@ -27,6 +27,7 @@
 * [11 Acknowledgments](#11acknowledgments)
 * [个人总结](#个人总结)
 * [面试题](#面试题)
+* [源码实战](#源码实战)
 * [相关链接](#相关链接)
 
 
@@ -489,6 +490,471 @@ Raft 采用了一个加入“联合 共识（Joint Consensus）”的办法来�
 源码验证：选举时 term 和日志项如何比较的？
 
 幽灵日志如何产生？
+
+
+## 源码实战
+
+> 注：代码来源 cubefs/raft 项目
+
+### Raft Server
+
+服务 `RaftServer` 分别监听两个端口，一个用于心跳（Heartbeat），一个用于日志复制（Replicate）。`RaftServer` 负责消息通信以及选举和心跳触发，实现了 `raft` 底层架构。`multi-raft` 的各个实例则维护在 `rs.rafts` 中。
+
+```go
+func NewMultiTransport(raft *RaftServer, config *TransportConfig) (Transport, error) {
+	mt := new(MultiTransport)
+
+	if ht, err := newHeartbeatTransport(raft, config); err != nil {
+		return nil, err
+	} else {
+		mt.heartbeat = ht
+	}
+	if rt, err := newReplicateTransport(raft, config); err != nil {
+		return nil, err
+	} else {
+		mt.replicate = rt
+	}
+
+	mt.heartbeat.start()
+	mt.replicate.start()
+	return mt, nil
+}
+```
+
+主线程 `run()` 循环如下：`rs.heartc` 处理心跳消息，`rs.ticker.C` 定时器进行心跳发送和选举超时检测(只有 Leader 会发送心跳)。
+
+```go
+func (rs *RaftServer) run() {
+	ticks := 0
+	for {
+		select {
+		case <-rs.stopc:
+			return
+
+		case id := <-fatalStopc:
+			rs.mu.Lock()
+			delete(rs.rafts, id)
+			rs.mu.Unlock()
+
+		case m := <-rs.heartc:
+			switch m.Type {
+			case proto.ReqMsgHeartBeat:
+				rs.handleHeartbeat(m)
+			case proto.RespMsgHeartBeat:
+				rs.handleHeartbeatResp(m)
+			}
+
+		case <-rs.ticker.C:
+			ticks++
+			if ticks >= rs.config.HeartbeatTick {
+				ticks = 0
+				rs.sendHeartbeat()
+			}
+
+			rs.mu.RLock()
+			for _, raft := range rs.rafts {
+				raft.tick()
+			}
+			rs.mu.RUnlock()
+		}
+	}
+}
+```
+
+`RaftServer` 主要配置参数：
+
+```go
+type Config struct {
+	TransportConfig
+
+	NodeID uint64
+	TickInterval time.Duration   // Raft 时钟周期，默认 2s
+	HeartbeatTick int            // 心跳间隔，默认1个TickInterval
+	ElectionTick int             // 选举超时，默认5个TickInterval，超过这个时间未收到心跳则触发选举
+	// ElectionTick 会生成一个随机间隔  r.config.ElectionTick + r.rand.Intn(r.config.ElectionTick)
+	...
+}
+```
+
+### 消息路由
+
+消息 `Message` 类型定义如下，主要分为请求和响应两类：
+
+```go
+const (
+	ReqMsgAppend MsgType = iota    // 日志复制请求
+	ReqMsgPreVote                  // 预投票请求
+	ReqMsgHeartBeat                // 心跳请求
+	ReqMsgSnapShot                 // 快照请求
+	ReqMsgVote                     // 投票请求
+	RespMsgAppend                  // 日志复制响应
+	RespMsgPreVote                 // 预投票响应
+	RespMsgHeartBeat               // 心跳响应
+	RespMsgSnapShot                // 快照响应
+	RespMsgVote                    // 投票响应
+	LocalMsgHup                    // 本地选举超时消息
+	LocalMsgProp                   // 本地提案消息
+	LeaseMsgOffline                // 租约离线消息
+	LeaseMsgTimeout                // 租约超时消息
+	ReqCheckQuorum                 // 法定人数检查请求
+	RespCheckQuorum                // 法定人数检查响应
+)
+```
+
+`multi-raft` 实现逻辑是基于消息中携带的 `raftid` 来路由消息到确定的 `raft` 实例消费。
+
+```go
+func (rs *RaftServer) reciveMessage(m *proto.Message) {
+	if m.Type == proto.ReqMsgHeartBeat || m.Type == proto.RespMsgHeartBeat {
+		rs.heartc <- m
+		return
+	}
+
+	rs.mu.RLock()
+	raft, ok := rs.rafts[m.ID]
+	rs.mu.RUnlock()
+	if ok {
+		raft.reciveMessage(m)
+	}
+}
+```
+
+`replicateTransport` 的处理方式和 `heartbeatTransport` 类似，区别在于它还需要处理快照消息：
+
+```go
+func (t *replicateTransport) handleConn(conn *util.ConnTimeout) {
+	if msg, err := reciveMessage(bufRd); err != nil {
+		logger.Error(fmt.Sprintf("[replicateTransport] recive from conn error, %s", err.Error()))
+		return
+	} else {
+		//logger.Debug(fmt.Sprintf("Recive %v from (%v)", msg.ToString(), conn.RemoteAddr()))
+		if msg.Type == proto.ReqMsgSnapShot {
+			if err := t.handleSnapshot(msg, conn, bufRd); err != nil {
+				return
+			}
+		} else {
+			t.raftServer.reciveMessage(msg)
+		}
+	}
+}
+```
+
+### 消息处理
+
+下面通过客户端提交日志的流程，来了解 `raft` 的实现逻辑。
+
+```go
+k1 := "key1"
+v1 := "some data"
+servers[0].Submit(raftId1, encode([]byte(k1), []byte(v1)))
+sm1 := servers[0].rafts[raftId1].raftConfig.StateMachine.(*testStateMachine)
+<-sm1.applyC
+val, _ := sm1.store.Get(k1)
+require.Equal(t, val, []byte(v1))
+```
+
+集群初始化后，服务状态信息如下：
+
+```
+Leader: NodeID = 1 (RaftId = 11)
+Follower1: NodeID = 2 (RaftId = 11)
+Follower2: NodeID = 3 (RaftId = 11)
+Term: 1
+```
+
+#### 1、LocalMsgProp (Leader)
+
+`Leader` 状态机信息如下：
+
+```
+Leader raftFsm.raftLog:
+firstIndex: 1
+lastIndex: 1
+committed: 1
+applied: 1
+unstable.offset=2
+len(unstable.Entries)=0
+curApplied=1
+```
+
+准备消息 `LocalMsgProp`。
+
+```
+Type: proto.LocalMsgProp
+From: Leader NodeID   1
+To: Follower NodeID   0
+Term: 0
+Index: 0
+LogTerm: 前一条日志的任期 0
+Commit: 0
+Entries: [
+    {
+        Type: EntryNormal
+        Term: 当前任期 1
+        Index: s.raftFsm.raftLog.lastIndex() + 1 (下一条日志索引)  2
+        Data: encode([]byte("key1"), []byte("some data"))
+    }
+]
+```
+
+追加日志到 `raftFsm.raftLog.unstable.Entries` 中，此时不进行 `committed` 更新。
+
+```go
+func (r *raftFsm) appendEntry(es ...*proto.Entry) {
+	r.raftLog.append(es...)
+	r.replicas[r.config.NodeID].maybeUpdate(r.raftLog.lastIndex(), r.raftLog.committed)
+	r.maybeCommit()
+}
+```
+
+尝试进行日志持久化，以及日志应用，因为 `committed=1` 未发生变化，不做任何操作。 
+
+```go
+// 持久化前
+Leader raftFsm.raftLog:
+firstIndex: 1
+lastIndex: 2
+committed: 1
+applied: 1
+unstable.offset=2
+len(unstable.Entries)=1
+curApplied=1
+
+s.persist()
+s.apply()
+s.advance()
+
+// 持久化后
+Leader raftFsm.raftLog:
+firstIndex: 1
+lastIndex: 2
+committed: 1
+applied: 1
+unstable.offset=3
+len(unstable.Entries)=0
+curApplied=1
+```
+
+消息通过 `bcastAppend()` 广播给所有 Follower。
+
+```
+Type: proto.LocalMsgProp
+From: Leader NodeID   1
+To: Follower NodeID   2 3
+Term: 1
+Index: 1
+LogTerm: 1
+Commit: 1
+Entries: [
+    {
+        Type: EntryNormal
+        Term: 1
+        Index: 2
+        Data: encode([]byte("key1"), []byte("some data"))
+    }
+]
+```
+
+#### 2、ReqMsgAppend (Leader → Follower)
+
+`Follower` 收到消息，当前状态机和接受的消息如下：
+
+```
+Follower raftFsm.raftLog:
+firstIndex: 1
+lastIndex: 1
+committed: 1
+applied: 1
+unstable.offset=2
+len(unstable.Entries)=0
+curApplied=1
+
+Type: proto.ReqMsgAppend
+From: Leader NodeID   1
+To: Follower NodeID   2,3
+Term:  1
+Index: 1
+LogTerm: 1
+Commit: 1
+Entries: [
+    {
+        Type: EntryNormal
+        Term: 1
+        Index: 2
+        Data: encode([]byte("key1"), []byte("some data"))
+    }
+]
+```
+
+追加日志到 `raftFsm.raftLog.unstable.Entries` 中。
+
+```go
+func (r *raftFsm) handleAppendEntries(m *proto.Message) {
+	r.raftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, m.Entries...)
+}
+```
+
+此时状态机信息如下：
+
+```
+Follower raftFsm.raftLog:
+firstIndex: 1
+lastIndex: 2
+committed: 1
+applied: 1
+unstable.offset=2
+len(unstable.Entries)=1
+curApplied=1
+```
+
+#### 3、RespMsgAppend (Follower → Leader)
+
+发送 `RespMsgAppend` 响应消息给 `Leader`。
+
+```
+Type: proto.RespMsgAppend
+From: Follower NodeID   2,3
+To: Leader NodeID   1
+Term:  1
+Index: 2
+LogTerm: 0
+Commit: 1
+Entries: []
+```
+
+4、RespMsgAppend (Leader)
+
+`Leader` 接收 `RespMsgAppend` 的响应消息。
+
+此时状态机信息如下：
+
+```
+Leader raftFsm.raftLog:
+firstIndex: 1
+lastIndex: 2
+committed: 1
+applied: 1
+unstable.offset=3
+len(unstable.Entries)=0
+curApplied=1
+```
+
+在满足 `quorum` 条件后，更新状态机 committed=2。
+
+```
+Leader raftFsm.raftLog:
+firstIndex: 1
+lastIndex: 2
+committed: 2
+applied: 1
+unstable.offset=3
+len(unstable.Entries)=0
+curApplied=1
+```
+
+尝试进行日志持久化，以及日志应用，因为 `applied < committed`，需要进行日志持久化，日志写入 `wal` 文件中并应用到状态机中。
+
+```go
+s.persist()
+s.apply()
+s.advance()
+```
+
+执行后状态机信息如下：
+
+```
+Leader raftFsm.raftLog:
+firstIndex: 1
+lastIndex: 2
+committed: 2
+applied: 2
+unstable.offset=3
+len(unstable.Entries)=0
+curApplied=2
+```
+
+#### 5、ReqMsgAppend (Leader → Follower)
+
+`Leader` 发送 `ReqMsgAppend` 消息给所有 `Follower`，通知 `Follower` 更新 `committed=2`。
+
+```
+Type: proto.ReqMsgAppend
+From: Leader NodeID   1
+To: Follower NodeID   2,3
+Term:  1
+Index: 2
+LogTerm: 1
+Commit: 2
+Entries: []
+```
+
+#### 6、RespMsgAppend (Follower → Leader)
+
+`Follower` 接收 `ReqMsgAppend` 消息，此时状态机信息如下：
+
+```
+Follower raftFsm.raftLog:
+firstIndex: 1
+lastIndex: 2
+committed: 1
+applied: 1
+unstable.offset=3
+len(unstable.Entries)=0
+curApplied=1
+```
+
+更新当前 `committed` 和 `applied` 并进行日志持久化，以及日志应用。
+
+```
+Follower raftFsm.raftLog:
+firstIndex: 1
+lastIndex: 2
+committed: 2
+applied: 2
+unstable.offset=3
+len(unstable.Entries)=0
+curApplied=2
+```
+
+发送 `RespMsgAppend` 响应消息给 `Leader`。
+
+```
+Type: proto.RespMsgAppend
+From: Follower NodeID   2,3
+To: Leader NodeID   1
+Term:  1
+Index: 2
+LogTerm: 0
+Commit: 2
+Entries: []
+```
+
+#### 7、RespMsgAppend (Leader)
+
+`Leader` 接收 `RespMsgAppend` 的响应消息。
+
+```
+Type: proto.RespMsgAppend
+From: Follower NodeID   2,3
+To: Leader NodeID   1
+Term:  1
+Index: 2
+LogTerm: 0
+Commit: 2
+```
+
+Leader 最终状态机。
+
+```
+Leader raftFsm.raftLog:
+firstIndex: 1
+lastIndex: 2
+committed: 2
+applied: 2
+unstable.offset=3
+len(unstable.Entries)=0
+curApplied=2
+```
 
 
 ## 相关链接
