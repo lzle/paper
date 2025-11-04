@@ -956,6 +956,172 @@ len(unstable.Entries)=0
 curApplied=2
 ```
 
+### META 
+
+文件完整结构
+
+```
++------------------------+------------------------+
+|      HardState         |     TruncateMeta       |
+|      (24 bytes)        |      (16 bytes)        |
++------------------------+------------------------+
+| Term(8) Commit(8)      | truncIndex(8)          |
+| Vote(8)                | truncTerm(8)           |
++------------------------+------------------------+
+  Offset 0-23              Offset 24-39
+```
+
+```go
+type HardState struct {
+    Term   uint64  // 当前任期 (8 bytes)
+    Vote   uint64  // 投票给谁 (8 bytes)
+    Commit uint64  // 已提交索引 (8 bytes)
+}
+
+type truncateMeta struct {
+    truncIndex uint64  // 被截断的最后一条日志索引
+    truncTerm  uint64  // 该索引位置的任期号
+}
+```
+
+### WAL Log
+
+#### Footer Record
+
+```
+Footer Record 完整结构 (29 bytes):
+
++----------+----------+----------------------------------+----------+
+| recType  | dataLen  | data                             | crc      |
+| (1 byte) | (8 byte) | (16 bytes)                       | (4 byte) |
++----------+----------+----------------------------------+----------+
+  0x03       0x10       ↓                                  checksum
+                        |
+                        +-- indexOffset(8B) + magic(8B)
+
+详细展开:
++----------+----------+------------------+------------------+----------+
+| recType  | dataLen  | indexOffset      | magic            | crc      |
+| (1 byte) | (8 byte) | (8 bytes)        | (8 bytes)        | (4 byte) |
++----------+----------+------------------+------------------+----------+
+  0x03       0x10       Index位置          footerMagic       checksum
+
+|<- recType ->|<- dataLen ->|<--------- data (16B) -------->|<- crc ->|
+     1B            8B         indexOffset(8B) + magic(8B)      4B
+
+|<----------------------- Total: 29 bytes -------------------------------->|
+```
+
+```
+// record格式
+type record struct {
+	recType recordType // 字节类型
+	dataLen uint64     // 八字节大端数据长度
+	data    []byte     // []byte recordData.Encode()
+	crc     uint32     // 固定四字节
+}
+
+// 一个record写入时最多需要多少字节的空间
+func recordSize(data recordData) int {
+	return 1 + 8 + int(data.Size()) + 4
+}
+
+type footerRecord struct {
+	indexOffset uint64
+	magic       []byte
+}
+
+// Record Header (13 bytes)
+recType:  1 byte  = 0x03 (recTypeFooter)
+dataLen:  8 bytes = 0x0000000000000010 (16 in BigEndian)
+crc:      4 bytes = CRC32 校验和
+
+// Footer Data (16 bytes)
+indexOffset: 8 bytes  = Index Record 在文件中的偏移量 (BigEndian)
+magic:       8 bytes  = [0xf9, 0xbf, 0x3e, 0x0a, 0xd3, 0xc5, 0xcc, 0x3f]
+                        对应 ASCII: "RAFTWALL" 的某种编码
+```
+
+#### Index Record
+
+```
+Index Record 完整结构 (可变长度):
+
++----------+----------+----------------------------------+----------+
+| recType  | dataLen  | data                             | crc      |
+| (1 byte) | (8 byte) | (可变长度)                        | (4 byte) |
++----------+----------+----------------------------------+----------+
+  0x02       N         ↓                                  checksum
+                       |
+                       +-- itemCount + items[]
+
+详细展开 (假设 5 条 Entry):
++----------+----------+----------+---------+---------+-----+---------+----------+
+| recType  | dataLen  |itemCount | item[0] | item[1] | ... | item[4] | crc      |
+| (1 byte) | (8 byte) | (4 byte) |(20 byte)|(20 byte)|     |(20 byte)| (4 byte) |
++----------+----------+----------+---------+---------+-----+---------+----------+
+  0x02       0x68       5个Entry   详见下方  详见下方       详见下方  checksum
+
+|<- recType ->|<- dataLen ->|<---------------- data (104B) ---------------->|<- crc ->|
+     1B            8B         itemCount(4B) + 5*item(20B each)                 4B
+
+|<--------------------------- Total: 1+8+4+100+4 = 117 bytes ----------------------------------->|
+```
+
+```go
+func decodeLogIndex(data []byte) logEntryIndex {
+	offset := 0
+
+	nItems := binary.BigEndian.Uint32(data[offset:])
+	offset += 4
+	li := make([]indexItem, nItems)
+
+	for i := 0; i < int(nItems); i++ {
+		li[i].logindex = binary.BigEndian.Uint64(data[offset:])
+		offset += 8
+		li[i].logterm = binary.BigEndian.Uint64(data[offset:])
+		offset += 8
+		li[i].offset = binary.BigEndian.Uint32(data[offset:])
+		offset += 4
+	}
+	return li
+}
+
+// item 对应 indexItem 结构体
+type indexItem struct {
+	logindex uint64 // 日志的index  8 bytes
+	logterm  uint64 // 日志的term  8 bytes
+	offset   uint32 // 日志在文件中的偏移  4 bytes
+}
+
+type logEntryIndex []indexItem
+```
+
+#### LogEntry Record
+
+完整结构
+
+```
++----------+----------+----------------------------------+----------+
+| recType  | dataLen  | data                             | crc      |
+| (1 byte) | (8 byte) | (17+变长 bytes)                  | (4 byte) |
++----------+----------+----------------------------------+----------+
+  0x01       变长       ↓                                  checksum
+                        |
+                        +-- Entry头部(17B) + Entry.Data(变长)
+
+详细展开:
++----------+----------+----------+----------+----------+----------+----------+
+| recType  | dataLen  | Type     | Term     | Index    | Data     | crc      |
+| (1 byte) | (8 byte) | (1 byte) | (8 bytes)| (8 bytes)| (变长)   | (4 byte) |
++----------+----------+----------+----------+----------+----------+----------+
+  0x01       总长度      Entry类型  Raft任期  日志索引   应用数据   checksum
+
+|<- recType ->|<- dataLen ->|<-------- Entry头部(17B) ------->|<- crc ->|
+     1B            8B         Type(1B) + Term(8B) + Index(8B)    4B
+
+|<----------------------- Total: 30+变长 bytes -------------------------->|
+```
 
 ## 相关链接
 
