@@ -1,6 +1,8 @@
 # Finding a needle in Haystack: Facebook’s photo storage
 Doug Beaver, Sanjeev Kumar, Harry C. Li, Jason Sobel, Peter Vajgel, Facebook Inc. {doug, skumar, hcli, jsobel, pv}@facebook.com
 
+> The 9th USENIX Symposium on Operating Systems Design and Implementation, 2010
+
 ## 目录
 * [Abstract](#abstract)
 * [1、Introduction](#1introduction)
@@ -90,8 +92,6 @@ Doug Beaver, Sanjeev Kumar, Harry C. Li, Jason Sobel, Peter Vajgel, Facebook Inc
 <div align=center><img src="images/haystack_fig_2.png" width=400></div>
 
 我们最初在每个 NFS 卷的目录中存储数千个文件，这导致即便读取单张图片也需要过多的磁盘操作。由于 NAS 设备管理目录元数据的方式，将数千个文件放在同一目录中效率极低，因为该目录的 blockmap 太大，无法被设备有效缓存。因此，获取单张图片通常需要超过 10 次磁盘操作。在将目录大小减少到每目录数百张图片后，系统仍然通常需要 3 次磁盘操作才能获取一张图片：一次将目录元数据读入内存，一次将 inode 加载到内存，第三次读取文件内容。
-
-为了进一步减少磁盘操作，我们让 Photo Store 服务器显式缓存 NAS 设备返回的文件句柄（file handle）。当第一次读取文件时，Photo Store 服务器会像平常一样打开文件，同时在 memcache [18] 中缓存文件名到文件句柄的映射。当请求的文件句柄已被缓存时，Photo Store 服务器会使用我们新增到内核中的自定义系统调用 open by filehandle 直接打开文件。遗憾的是，这种文件句柄缓存仅带来了有限的改进，因为不太热门的照片一开始就不太可能被缓存。
 
 为了进一步减少磁盘操作，我们让 Photo Store 服务器显式缓存 NAS 设备返回的文件句柄（file handle）。当第一次读取文件时，Photo Store 服务器会像平常一样打开文件，同时在 memcache [18] 中缓存文件名到文件句柄的映射。当请求的文件句柄已被缓存时，Photo Store 服务器会使用我们新增到内核中的自定义系统调用 open by filehandle 直接打开文件。遗憾的是，这种文件句柄缓存仅带来了有限的改进，因为不太热门的照片一开始就不太可能被缓存。
 
@@ -205,6 +205,8 @@ Store 机器在重启时使用了一个重要的优化——索引文件（index
 
 我们使用压缩来释放已删除照片占用的空间。删除的模式类似于照片浏览：较新的照片更可能被删除。在一年时间里，大约 25% 的照片会被删除。
 
+> 注：顺序读取旧文件，跳过重复或已删除的条目，复制到新文件中。删除操作会同时应用到两个文件。最终原子替换。
+
 #### 3.6.2 Saving more memory
 
 如前所述，Store 机器维护了一个包含标志（flags）的内存数据结构，但我们当前系统仅使用 flags 字段来标记 needle 为已删除。我们通过将已删除照片的偏移量设置为 0 来消除了对 flags 内存表示的需求。此外，Store 机器不在内存中跟踪 cookie 值，而是在从磁盘读取 needle 后检查提供的 cookie。通过这两种技术，Store 机器减少了约 20% 的内存占用。
@@ -247,7 +249,7 @@ Figure 9 显示了 Haystack Cache 的命中率。回想一下，Cache 仅在照�
 
 回想一下，Haystack 针对照片请求的长尾部分，并旨在在看似随机的读取下仍保持高吞吐量和低延迟。我们展示了 Store 机器在合成工作负载和生产工作负载下的性能结果。
 
-<div align=center><img src="images/haystack_table_4.png" width=400></div>
+<div align=center><img src="images/haystack_table_4.png" width=600></div>
 
 ##### 4.4.1 Experimental setup
 
@@ -314,3 +316,16 @@ Store 机器的 CPU 利用率较低，空闲时间在 92% 到 96% 之间。
 ## 6、Conclusion
 
 本文介绍了 Haystack，一种为 Facebook 照片应用设计的对象存储系统。我们设计 Haystack 旨在应对大型社交网络中照片共享所产生的长尾请求。其核心理念是在访问元数据时尽量避免磁盘操作。Haystack 提供了一种容错且简洁的照片存储方案，相较于使用 NAS 设备的传统方法，成本显著降低且吞吐量更高。此外，Haystack 支持增量扩展，这是必要的特性，因为我们的用户每周上传数亿张照片。
+
+
+> 小文件会造成的问题：
+
+> 即使最小的文件也至少占用 4KB 的空间，这会导致存储空间的浪费。
+> 每个文件在本地操作系统都会创建 inode 元数据，会增加查询元数据 IO 开销。
+
+> 设计思想：
+
+> 减少元数据大小，完全存储在内存中，避免了查询元数据的磁盘 IO 开销。元数据只记录文件、offset、size 等基础信息（Posix 文件系统会记录权限）。
+> 使用批量写入，提高写入处理能力。增加 cache、cdn 减少读取压力。
+
+> haystack directory 存储文件名和逻辑盘，图片ID映射关系，haystack store 存储图片数据，内存存储元数据。
