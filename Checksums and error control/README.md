@@ -5,6 +5,7 @@ Chen Luo · Michael J. Carey    19 Jul 2019
 
 * [1 Error Control Codes](#1-error-control-codes)
 * [2 More on Parity](#2-more-on-parity)
+* [3 Hamming Codes](#3-hamming-codes)
 * [5 Modular checkdigits](#5-modular-checkdigits)
 	* [5.2 Fletcher Checksum](#52-fletcher-checksum)
 	* [5.3 Cyclic Redundancy Checks](#53-cyclic-redundancy-checks)
@@ -24,6 +25,7 @@ Chen Luo · Michael J. Carey    19 Jul 2019
 尽管差错控制被划分为两个领域，但其中许多技术在两者之间是可以相互应用的。尤其是，较为优秀的差错检测码通常基于多项式生成元和伽罗瓦域算术。完全相同的技术也可以应用于某些较为简单的差错纠正码，或许仅需选择不同的生成多项式即可。这种趋同带来的一个结果是：对于较短的消息，一个足够长的校验和往往能够提供一定程度的差错纠正能力。一个典型例子是 ATM 信元首部，其采用一个 8 位校验和（或称“首部差错控制”字段，HEC）进行保护，这一长度对于仅有 32 位的首部而言通常远超差错检测所需。尽管 HEC 的设计目标是差错检测，但它同样能够提供一定的差错纠正功能。
 
 本章重点讨论在可以重复输入或重新传输的场景下所使用的差错检测码。对于差错纠正码仅作简要涉及，主要介绍汉明码（Hamming codes）这一较早且较为简单的差错纠正码。对差错纠正码的全面讨论远远超出了本书的预期范围。
+
 
 ## 2 More on Parity
 
@@ -67,6 +69,41 @@ $\text{if } p \approx 0, \text{ then } P_2 \approx \frac{(np)^2}{2}$ — 即未�
 二维奇偶校验在检测错误方面远优于简单的一维奇偶校验；只有在矩形角落位置出现的四个错误才可能未被检测到。（如果已知仅发生了一个错误，则可以通过纵向和横向奇偶校验失败的交点进行纠正。）该方法很快被更强大的 CRC-16 校验取代，相关内容见第 5.3 节。
 
 <div align=center><img src="images/cec_fig_1.png" width=500></div>
+
+
+## 3 Hamming Codes
+
+汉明码（Hamming code）[8] 是最早且最简单的差错纠正码之一，是单比特纠错（Single Error Correcting，SEC）码的典型示例。对于最简单的非平凡情况（也是通常的示例），取 4 个数据位和 3 个奇偶校验位，将它们排列成一个 7 位字，如 $d_7 d_6 d_5 p_4 d_3 p_2 p_1$，位编号从左至右为 7 到 1。编号为 $2^k$ 形式的位作为奇偶校验位，其余位作为数据位。
+
+在传输时，按照下面的方法设置奇偶校验位，并将整个 7 位字作为码字进行传输。
+
+$$
+\begin{align*}
+p_1 &= d_3 \oplus d_5 \oplus d_7 \quad \text{(the bits with a "1" in the bit number)} \\
+p_2 &= d_2 \oplus d_6 \oplus d_7 \quad \text{(the bits with a "2" in the bit number)} \\
+p_4 &= d_4 \oplus d_5 \oplus d_7 \quad \text{(the bits with a "4" in the bit number)}
+\end{align*}
+$$
+
+在接收端，通过以下方程计算校验子（syndrome） 如 $S = \{s_4, s_2, s_1\}$。
+
+$$
+\begin{align*}
+s_1 &= p_1 \oplus d_3 \oplus d_5 \oplus d_7 \\
+s_2 &= p_2 \oplus d_2 \oplus d_6 \oplus d_7 \\
+s_4 &= p_4 \oplus d_4 \oplus d_5 \oplus d_7
+\end{align*}
+$$
+
+若 $S = 0$，则所有比特均正确；若 $S \neq 0$，则校验子指示出错误比特的编号（假设仅发生一个错误）。
+
+汉明码的操作如 Figure 2 所示。
+
+<div align=center><img src="images/cec_fig_2.png" width=500></div>
+
+汉明码可以轻松扩展到更长的码字，只需将每个编号为 $2^k$ 的比特作为奇偶校验位，但无法扩展以纠正多个错误。这里使用的示例通常记作 $(7,4)$ 码：每个码字有 7 位，其中 4 位用于用户数据。一般的单比特纠错（SEC）汉明码可表示为 $(2^k - 1, 2^k - 1 - k)$ 码。例如 $(15,11)$ 码和 $(31,26)$ 码。
+
+如果再增加一个整体奇偶校验位，则可形成一种能够在内部奇偶校验失败但整体奇偶校验仍正确时检测到双比特错误的码，即单比特纠错、双比特检测（Single Error Correcting, Double Error Detecting，SEC-DED）码。
 
 
 ## 5 Modular checkdigits
