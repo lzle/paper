@@ -6,6 +6,9 @@ Chen Luo · Michael J. Carey    19 Jul 2019
 * [1 Error Control Codes](#1-error-control-codes)
 * [2 More on Parity](#2-more-on-parity)
 * [3 Hamming Codes](#3-hamming-codes)
+* [4 Modular Checkdigits and checksums](#4-modular-checkdigits-and-checksums)
+	* [4.1 Modular Arithmetic](#41-modular-arithmetic)
+	* [4.2 Modular Checkdigits](#42-modular-checkdigits)
 * [5 Modular checkdigits](#5-modular-checkdigits)
 	* [5.2 Fletcher Checksum](#52-fletcher-checksum)
 	* [5.3 Cyclic Redundancy Checks](#53-cyclic-redundancy-checks)
@@ -17,12 +20,14 @@ Chen Luo · Michael J. Carey    19 Jul 2019
 
 为应对错误数据的处理问题，逐渐发展出了两门相互关联但在一定程度上并行的学科。它们同属于“编码理论”（Coding Theory）的总体范畴，并统一归纳在“差错控制”（Error Control）这一通用名称之下。
 
-**差错检测（Error Detection）** 差错检测是在奇偶校验思想的基础上发展而来的，通过在数据后附加一个 8、16 或 32 位的“校验和”（checksum），以实现对错误的强大而可靠的检测。该校验和经过精心设计，使其对可能出现的错误具有高度敏感性：用于人工数据录入的校验和必须能够检测数字的换位和重复，而用于数据传输的校验和则必须能够检测长突发错误。
+差错检测（Error Detection）- 差错检测是在奇偶校验思想的基础上发展而来的，通过在数据后附加一个 8、16 或 32 位的“校验和”（checksum），以实现对错误的强大而可靠的检测。该校验和经过精心设计，使其对可能出现的错误具有高度敏感性：用于人工数据录入的校验和必须能够检测数字的换位和重复，而用于数据传输的校验和则必须能够检测长突发错误。
 一旦检测到错误，必然会触发某种形式的告警，并请求重新输入数据或重新传输数据。
 
-**差错纠正（Error Correction）** 当原始数据在空间上相距遥远（如遥测系统），或在时间上相隔较久（如数据记录）而无法直接获取时，就需要采用差错纠正。在这两种情况下，数据都必须携带足够的冗余信息，以便在存在错误的情况下重构原始数据。针对单比特错误的处理方法早已为人所知，而对仅涉及少数比特错误的处理方法也出现已久；然而，实际中的数据错误很少如此简单。由于在物理传输介质或记录介质上采用的编码方式，物理层面的许多单个错误在数据层面往往会表现为突发错误。因此，突发差错纠正显得尤为重要，但遗憾的是，这一问题在技术上极为困难。
+差错纠正（Error Correction）- 当原始数据在空间上相距遥远（如遥测系统），或在时间上相隔较久（如数据记录）而无法直接获取时，就需要采用差错纠正。在这两种情况下，数据都必须携带足够的冗余信息，以便在存在错误的情况下重构原始数据。针对单比特错误的处理方法早已为人所知，而对仅涉及少数比特错误的处理方法也出现已久；然而，实际中的数据错误很少如此简单。由于在物理传输介质或记录介质上采用的编码方式，物理层面的许多单个错误在数据层面往往会表现为突发错误。因此，突发差错纠正显得尤为重要，但遗憾的是，这一问题在技术上极为困难。
 
 尽管差错控制被划分为两个领域，但其中许多技术在两者之间是可以相互应用的。尤其是，较为优秀的差错检测码通常基于多项式生成元和伽罗瓦域算术。完全相同的技术也可以应用于某些较为简单的差错纠正码，或许仅需选择不同的生成多项式即可。这种趋同带来的一个结果是：对于较短的消息，一个足够长的校验和往往能够提供一定程度的差错纠正能力。一个典型例子是 ATM 信元首部，其采用一个 8 位校验和（或称“首部差错控制”字段，HEC）进行保护，这一长度对于仅有 32 位的首部而言通常远超差错检测所需。尽管 HEC 的设计目标是差错检测，但它同样能够提供一定的差错纠正功能。
+
+> 注：HEC（Header Error Control）基于 CRC 的校验码，使用 8 位 CRC 多项式，可以检查所有单比特错误，长度 ≤ 8 的突发错误，绝大多数多比特错误。此外还可以提供一定的纠错能力，主要是单比特纠错，40 位的数据用 256 个校验结果向量来表示是非常稀疏，可以建立对应关系。
 
 本章重点讨论在可以重复输入或重新传输的场景下所使用的差错检测码。对于差错纠正码仅作简要涉及，主要介绍汉明码（Hamming codes）这一较早且较为简单的差错纠正码。对差错纠正码的全面讨论远远超出了本书的预期范围。
 
@@ -80,8 +85,8 @@ $\text{if } p \approx 0, \text{ then } P_2 \approx \frac{(np)^2}{2}$ — 即未�
 $$
 \begin{align*}
 p_1 &= d_3 \oplus d_5 \oplus d_7 \quad \text{(the bits with a "1" in the bit number)} \\
-p_2 &= d_2 \oplus d_6 \oplus d_7 \quad \text{(the bits with a "2" in the bit number)} \\
-p_4 &= d_4 \oplus d_5 \oplus d_7 \quad \text{(the bits with a "4" in the bit number)}
+p_2 &= d_3 \oplus d_6 \oplus d_7 \quad \text{(the bits with a "2" in the bit number)} \\
+p_4 &= d_5 \oplus d_6 \oplus d_7 \quad \text{(the bits with a "4" in the bit number)}
 \end{align*}
 $$
 
@@ -90,8 +95,8 @@ $$
 $$
 \begin{align*}
 s_1 &= p_1 \oplus d_3 \oplus d_5 \oplus d_7 \\
-s_2 &= p_2 \oplus d_2 \oplus d_6 \oplus d_7 \\
-s_4 &= p_4 \oplus d_4 \oplus d_5 \oplus d_7
+s_2 &= p_2 \oplus d_3 \oplus d_6 \oplus d_7 \\
+s_4 &= p_4 \oplus d_5 \oplus d_6 \oplus d_7
 \end{align*}
 $$
 
@@ -105,6 +110,45 @@ $$
 
 如果再增加一个整体奇偶校验位，则可形成一种能够在内部奇偶校验失败但整体奇偶校验仍正确时检测到双比特错误的码，即单比特纠错、双比特检测（Single Error Correcting, Double Error Detecting，SEC-DED）码。
 
+> 注：Hamming (7,4)其参数为 $(n, k, d_{\min}) = (7, 4, 3)$，最小汉明距离为 3，最多可纠正的错误位数 $t = \left\lfloor \frac{d_{\min} - 1}{2} \right\rfloor$ 代入 $t = \left\lfloor \frac{3-1}{2} \right\rfloor = 1$。差错检测能力 $d_{\min} - 1 = 2$，可检测 2 bit 位错误。
+
+
+## 4 Modular Checkdigits and checksums
+
+这里所描述的大多数校验方法都采用某种形式的模运算：先从数据中导出一个相对较大的数值，再通过对某个模数取余，将该数值缩减为一个较小的值。在最简单的情况下，可以仅使用模 10（得到十进制的个位数字），或模 256（得到最低有效的 8 位）。通常，模数的选择基于一些不那么直观的准则，其目标是最大化错误检测能力。
+
+较为简单的技术采用普通的数值除法，更适合通过软件实现；而另一些方法则使用多项式除法，更适合硬件实现。例如，许多校验算法在模数为素数时效果最佳。普通奇偶校验就是模运算的最简单例子，它对比特之和取模 2。
+
+### 4.1 Modular Arithmetic
+
+在进行模 $p$ 的加法或减法时，只需将每个数值除以 $p$ 并取其正余数即可。而模运算下的乘法和除法则需要更加谨慎的处理。
+
+如果一个数 $a$ 与 $a'$ 在除以 $m$ 后得到相同的余数，则称“数 $a$ 模 $m$ 同余于 $a'$”。该关系记作：
+
+$$
+\begin{align*}
+a &\equiv a' \pmod{m} \\
+b &\equiv b' \pmod{m}
+\end{align*}
+$$
+
+考虑特定情况 $m = 12$ 和 $a = 21$ 和 $b = 20$。则有：
+
+$$
+a' = 9 \text{ and } b' = 8
+$$
+
+和
+
+$$
+ab \equiv a'b' \equiv 0 \pmod{12}
+$$
+
+尽管 $a$ 和 $b$ 都不与 12 模同余于零，但只有在模数为素数时，若积为零，才可以保证至少有一个因子为零。鉴于许多校验和通过使整体值同余于零来工作，这一性质是一个非常重要的要求。
+
+> 注：只有当模数 $m$ 是素数时，才能保证：若 ab≡0(mod m),则 a≡0(mod m) 或 b≡0(mod m)
+
+> 注：素数（也叫质数）是大于 1 的自然数，且它的正因数只有 1 和它本身，没有其他正整数能整除它。
 
 ## 5 Modular checkdigits
 
@@ -159,7 +203,6 @@ Fletcher 校验和被认为其差错检测能力几乎与下文所描述的 CRC-
 * 所有单比特错误，
 * 所有双比特错误，
 * 长度不超过 16 的突发错误中除 `0.000019%` 之外的全部错误，以及长度更长的突发错误中除 `0.0015%` 之外的全部错误。
-
 
 ### 5.3 Cyclic Redundancy Checks
 
