@@ -601,7 +601,7 @@ CRC-12 在一些较早的银行系统和航班预订系统中用于 6 位字符�
 * 计算结果（包括接收到的校验和）必须为 $x^{31} + x^{30} + x^{26} + x^{25} + x^{24} + x^{18} + x^{15} + x^{14} + x^{12} + x^{11} + x^{10} + x^8 + x^6 + x^5 + x^4 + x^3 + x + 1$ ，
   或以二进制表示为：1100 0111 0000 0100 1101 1101 0111 1011。
 
-实现代码示例：
+实现代码，输出计算过程：
 
 ```golang
 package main
@@ -610,28 +610,54 @@ import (
 	"fmt"
 )
 
-// crc16CCITT 计算 CRC-16/CCITT（多项式 x^16 + x^12 + x^5 + 1）
-func crc16CCITT(data []byte) uint16 {
-	var crc uint16 = 0xFFFF // 初始值
-	const poly uint16 = 0x1021
+func crc16(data []byte) uint16 {
+	var crc uint16 = 0x0000
+	const poly uint16 = 0x8005
 
-	for _, b := range data {
+	fmt.Printf("初始 CRC: 0x%04X = %016b\n", crc, crc)
+	fmt.Printf("多项式 (x^16+x^15+x^2+1): 0x%04X = %016b\n\n", poly, poly)
+
+	for idx, b := range data {
+		fmt.Printf("处理字节 %d: '%c' (0x%02X = %08b)\n", idx, b, b, b)
+		fmt.Printf("  处理前 CRC: 0x%04X = %016b\n", crc, crc)
+
 		crc ^= uint16(b) << 8
+		fmt.Printf("  XOR 后 CRC: 0x%04X = %016b\n", crc, crc)
+
 		for i := 0; i < 8; i++ {
 			if crc&0x8000 != 0 {
+				oldCrc := crc
 				crc = (crc << 1) ^ poly
+				fmt.Printf("    位 %d: 最高位=1, 左移并XOR多项式: %016b -> %016b\n", i, oldCrc, crc)
 			} else {
+				oldCrc := crc
 				crc <<= 1
+				fmt.Printf("    位 %d: 最高位=0, 仅左移:          %016b -> %016b\n", i, oldCrc, crc)
 			}
 		}
+		fmt.Printf("  处理后 CRC: 0x%04X = %016b\n\n", crc, crc)
 	}
 	return crc
 }
 
 func main() {
-	data := []byte("HELLO")
-	crc := crc16CCITT(data)
-	fmt.Printf("CRC-16/CCITT of %q: 0x%04X\n", data, crc)
+	originalData := []byte("HELLO")
+	specifiedCRC := uint16(30089)
+	
+	crcHighByte := byte(specifiedCRC >> 8)
+	crcLowByte := byte(specifiedCRC & 0xFF)
+	
+	dataWithCRC := append(originalData, crcHighByte, crcLowByte)
+	
+	fmt.Println("验证: 对完整数据（HELLO + 30089）计算 CRC")
+	fmt.Println("=" + string(make([]byte, 60)))
+	finalCRC := crc16(dataWithCRC)
+	fmt.Printf("完整数据的 CRC: 0x%04X = %d\n", finalCRC, finalCRC)
+	if finalCRC == 0 {
+		fmt.Println("✓ CRC 为 0，数据校验正确！")
+	} else {
+		fmt.Println("✗ CRC 不为 0，数据校验失败")
+	}
 }
 ```
 
