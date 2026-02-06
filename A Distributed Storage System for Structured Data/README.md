@@ -5,8 +5,38 @@
 
 ## 目录
 
-
-
+- [Abstract](#abstract)
+- [1 Introduction](#1-introduction)
+- [2 Data Model](#2-data-model)
+  - [Rows](#rows)
+  - [Column Families](#column-families)
+  - [Timestamps](#timestamps)
+- [3 API](#3-api)
+- [4 Building Blocks](#4-building-blocks)
+- [5 Implementation](#5-implementation)
+  - [5.1 Tablet Location](#51-tablet-location)
+  - [5.2 Tablet Assignment](#52-tablet-assignment)
+  - [5.3 Tablet Serving](#53-tablet-serving)
+  - [5.4 Compactions](#54-compactions)
+- [6 Refinements](#6-refinements)
+  - [Locality groups](#locality-groups)
+  - [Compression](#compression)
+  - [Caching for read performance](#caching-for-read-performance)
+  - [Bloom filters](#bloom-filters)
+  - [Commit-log implementation](#commit-log-implementation)
+  - [Speeding up tablet recovery](#speeding-up-tablet-recovery)
+  - [Exploiting immutability](#exploiting-immutability)
+- [7 Performance Evaluation](#7-performance-evaluation)
+  - [Single tablet-server performance](#single-tablet-server-performance)
+  - [Scaling](#scaling)
+- [8 Real Applications](#8-real-applications)
+  - [8.1 Google Analytics](#81-google-analytics)
+  - [8.2 Google Earth](#82-google-earth)
+  - [8.3 Personalized Search](#83-personalized-search)
+- [9 Lessons](#9-lessons)
+- [10 Related Work](#10-related-work)
+- [11 Conclusions](#11-conclusions)
+- [Acknowledgements](#acknowledgements)
 
 ## Abstract
 
@@ -131,7 +161,7 @@ Master 负责检测 tablet server 不再提供服务的情况，并尽快重新�
 
 Tablet 的持久状态存储在 GFS 中，如 Figure 5 所示。更新操作会提交到一个 commit log 中，该日志存储重做记录（redo records）。其中，最近提交的更新会存放在内存中的一个排序缓冲区，称为 memtable；较早的更新则存放在一系列 SSTable 中。要恢复一个 tablet，tablet server 会先从 METADATA 表中读取其元数据。元数据包含组成该 tablet 的 SSTables 列表，以及一组重做点（redo points），这些点是指向可能包含该 tablet 数据的 commit log 的指针。服务器会将 SSTable 的索引读入内存，并通过应用自重做点以来提交的所有更新来重建 memtable。
 
-<div align=center><img src="images/bigtable_fig_5.png" width=380></div>
+<div align=center><img src="images/bigtable_fig_5.png" width=350></div>
 
 当写操作到达 tablet server 时，服务器会检查操作是否合法，并确认发送者是否有权限执行该变更。权限验证通过读取 Chubby 文件中允许写入者列表完成（这几乎总是能命中 Chubby 客户端缓存）。合法的变更会写入 commit log。为了提高大量小变更的吞吐量，会使用 group commit。写操作提交后，其内容会插入到 memtable 中。
 
@@ -195,8 +225,134 @@ Tablet 的持久状态存储在 GFS 中，如 Figure 5 所示。更新操作会�
 
 ## 7 Performance Evaluation
 
+我们搭建了一个包含 N 个 tablet server 的 Bigtable 集群，用于在改变 N 的情况下评估 Bigtable 的性能与可扩展性。tablet server 被配置为使用 1 GB 内存，并将数据写入一个由 1786 台机器组成的 GFS cell，其中每台机器配备 两块 400 GB 的 IDE 硬盘。本次测试所使用的 Bigtable 负载由 N 台客户端机器生成。（我们使用与 tablet server 数量相同的客户端数量，以确保客户端不会成为性能瓶颈。）每台机器均配备 两颗双核 2 GHz 的 Opteron 处理器，具有足以容纳所有运行进程工作集的物理内存，以及 一条千兆以太网链路。这些机器通过一个两级树形结构的交换网络互连，在根节点处可提供约 100–200 Gbps 的聚合带宽。所有机器均位于同一托管设施内，因此任意两台机器之间的往返时延（RTT）均小于 1 毫秒。
 
+tablet server 与 master、测试客户端以及 GFS server 均运行在同一组机器上。每台机器都运行一个 GFS server。其中部分机器还同时运行 tablet server、客户端进程，或在实验期间与其他作业共享资源池的进程。
 
+$R$ 表示测试中涉及的 Bigtable 行键（row key）的不同数量。$R$ 的选取使得每个基准测试在每个 tablet server 上大约读写 1 GB 数据。
 
+顺序写入（sequential write）基准测试使用了名称从 0 到 R−1 的行键。该行键空间被划分为 10N 个大小相等的区间。这些区间由一个中心调度器分配给 N 个客户端：一旦某个客户端完成了先前分配给它的区间，调度器便立即将下一个可用区间分配给该客户端。这种动态分配策略有助于缓解由于客户端机器上同时运行的其他进程所导致的性能波动影响。在每个行键下，我们写入一个字符串值。该字符串以随机方式生成，因此不可压缩。此外，不同行键下的字符串彼此互不相同，从而不存在跨行压缩（cross-row compression）的可能性。随机写入（random write）基准测试与顺序写入测试基本相同，不同之处在于：在写入之前，先对行键进行一次 对 R 取模的哈希运算。通过这种方式，写入负载在整个基准测试过程中能够被近似均匀地分布到整个行键空间上。
+
+顺序读取基准测试以完全相同的方式生成行键，其方式与顺序写入基准测试一致，但不同之处在于：它不是在该行键下写入数据，而是读取存储在该行键下的字符串（该字符串由先前一次顺序写入基准测试写入）。类似地，随机读取基准测试在操作方式上对应于随机写入基准测试。
+
+扫描基准测试与顺序读取基准测试类似，但使用了 Bigtable API 提供的对行键范围内所有值进行扫描的支持。使用扫描操作可以减少基准测试中执行的 RPC 数量，因为一次 RPC 就可以从一个 tablet server 获取一大批连续的值。
+
+随机读取（mem）基准测试与随机读取基准测试类似，但包含基准测试数据的 locality group 被标记为 in-memory，因此读取请求由 tablet server 的内存直接满足，而不需要进行 GFS 读取。仅在该基准测试中，我们将每个 tablet server 上的数据量从 1 GB 降低到 100 MB，以便其能够轻松地放入 tablet server 可用的内存中。
+
+Figure 6 展示了在 Bigtable 中对 1000 字节大小的值进行读写时，这些基准测试性能的两个视角。表格显示的是每个 tablet server 每秒执行的操作数；图形显示的是系统整体的每秒操作总数。
+
+<div align=center><img src="images/bigtable_fig_6.png" width=700></div>
+
+### Single tablet-server performance
+
+我们首先考虑只有一个 tablet server 时的性能。随机读取的速度比所有其他操作慢一个数量级甚至更多。每一次随机读取都需要通过网络从 GFS 向 tablet server 传输一个 64 KB 的 SSTable 块，而其中实际只使用了一个 1000 字节的值。tablet server 每秒大约执行 1200 次读取操作，这相当于从 GFS 读取大约 75 MB/s 的数据。由于网络协议栈、SSTable 解析以及 Bigtable 代码中的开销，这样的带宽已经足以使 tablet server 的 CPU 达到饱和，同时也几乎足以使系统中使用的网络链路达到饱和。大多数具有此类访问模式的 Bigtable 应用都会将块大小减小到更小的值，通常为 8 KB。
+
+从内存中进行的随机读取要快得多，因为每次 1000 字节的读取都可以直接由 tablet server 的本地内存满足，而无需从 GFS 获取一个较大的 64 KB 块。
+
+随机写入和顺序写入的性能优于随机读取，这是因为每个 tablet server 都会将所有到达的写入追加到一个单一的 commit log 中，并使用 group commit 将这些写入高效地流式写入 GFS。随机写入与顺序写入在性能上没有显著差异；在这两种情况下，所有写入都会被记录到同一个 commit log 中。
+
+顺序读取的性能优于随机读取，因为每一个从 GFS 获取的 64 KB SSTable 块都会被存入 block cache，并被用于服务接下来的 64 次读取请求。
+
+扫描操作的速度更快，因为 tablet server 可以在一次客户端 RPC 的响应中返回大量的值，从而将 RPC 开销摊销到大量的数据值之上。
+
+### Scaling
+
+随着系统中 tablet server 的数量从 1 增加到 500，聚合吞吐量显著提升，增幅超过一百倍。例如，随着 tablet server 数量增加 500 倍，从内存进行的随机读取性能几乎提升了 300 倍。这种现象出现的原因在于，该基准测试的性能瓶颈位于单个 tablet server 的 CPU。
+
+然而，性能并未线性增长。对于大多数基准测试而言，当 tablet server 的数量从 1 增加到 50 时，每个服务器的吞吐量会出现明显下降。这种下降是由多服务器配置下的负载不均衡所导致的，通常是由于其他进程争用 CPU 和网络资源。我们的负载均衡算法尝试处理这种不均衡，但由于两个主要原因，无法做到完全理想：其一，为了减少 tablet 移动的次数，重新平衡操作受到节流限制（当 tablet 被移动时，其在一小段时间内不可用，通常少于一秒）；其二，随着基准测试的推进，测试所产生的负载会不断发生变化。
+
+随机读取基准测试表现出最差的扩展性（当服务器数量增加 500 倍时，聚合吞吐量仅增加约 100 倍）。这是因为（如前所述），每一次 1000 字节的读取都需要通过网络传输一个较大的 64 KB 块。这种传输会使网络中多个共享的 1 Gigabit 链路达到饱和，因此随着机器数量的增加，每台服务器的吞吐量会显著下降。
+
+## 8 Real Applications
+
+截至 2006 年 8 月，在 Google 的各类机器集群中运行着 388 个非测试用途的 Bigtable 集群，总计约 24,500 个 tablet server。Table 1 给出了每个集群中 tablet server 数量的大致分布。许多集群用于开发目的，因此在相当长的时间内处于空闲状态。有一组由 14 个繁忙集群组成的集群群组，共包含 8069 个 tablet server，其聚合请求量超过每秒 120 万次，入站 RPC 流量约为 741 MB/s，出站 RPC 流量约为 16 GB/s。
+
+<div align=center><img src="images/bigtable_table_1.png" width=300></div>
+
+Table 2 提供了当前正在使用的一些表的相关数据。一些表存储面向用户提供服务的数据，而另一些表则存储用于批处理的数据；这些表在总体规模、平均单元大小、从内存中提供的数据比例以及表模式的复杂性等方面差异很大。在本节的其余部分中，我们将简要介绍三个产品团队如何使用 Bigtable。
+
+<div align=center><img src="images/bigtable_table_2.png" width=700></div>
+
+### 8.1 Google Analytics
+
+Google Analytics[analytics.google.com]是一项帮助网站管理员分析其网站流量模式的服务。它提供聚合统计信息，例如每日的唯一访问者数量以及按 URL 统计的每日页面浏览量，同时还提供站点跟踪报告，例如在用户此前浏览过某个特定页面的前提下，其完成购买的用户比例。
+
+为启用该服务，网站管理员会在其网页中嵌入一小段 JavaScript 程序。每当页面被访问时，该程序就会被调用，并将有关该请求的各种信息记录到 Google Analytics 中，例如用户标识符以及被获取页面的相关信息。Google Analytics 对这些数据进行汇总，并将结果提供给网站管理员。
+
+下面我们简要描述 Google Analytics 所使用的两张表。原始点击表（约 200 TB）为每一个终端用户会话维护一行记录。行键是一个包含网站名称以及会话创建时间的元组。该模式保证了访问同一网站的会话在存储上是连续的，并且按时间顺序排序。该表压缩后约为原始大小的 14%。
+
+汇总表（约 20 TB）为每个网站包含多种预定义的汇总信息。该表通过周期性调度的 MapReduce 作业从原始点击表生成。每个 MapReduce 作业都会从原始点击表中提取最近的会话数据。整个系统的吞吐量受限于 GFS 的吞吐能力。该表压缩后约为原始大小的 29%。
+
+### 8.2 Google Earth
+
+Google 运营着一系列服务，通过基于 Web 的 Google Maps 界面（maps.google.com）以及 Google Earth（earth.google.com）定制客户端软件，为用户提供对全球地表高分辨率卫星影像的访问。这些产品允许用户在全球地表上进行导航：他们可以在不同分辨率级别下平移、查看并标注卫星影像。该系统使用一张表进行数据预处理，并使用另一组表来为客户端提供数据服务。
+
+预处理流水线使用一张表来存储原始影像数据。在预处理过程中，这些影像会被清洗并整合为最终用于对外服务的数据。该表大约包含 70 TB 的数据，因此以磁盘方式提供服务。由于图像本身已经经过高效压缩，因此禁用了 Bigtable 的压缩功能。
+
+影像表中的每一行对应一个单独的地理区域片段。行键的命名方式保证相邻的地理区域片段在存储上彼此接近。该表包含一个列族，用于记录每个区域片段的数据来源。这个列族包含大量列，基本上每一列对应一幅原始数据影像。由于每个区域片段仅由少数几幅影像构建，因此该列族非常稀疏。
+
+预处理流水线大量依赖于在 Bigtable 之上运行的 MapReduce 来完成数据转换。在某些 MapReduce 作业期间，整个系统在每个 tablet server 上处理的数据量超过 1 MB/秒。
+
+对外服务系统使用一张表来索引存储在 GFS 中的数据。该表规模相对较小（约 500 GB），但必须在每个数据中心以低延迟支撑每秒数万次查询。因此，该表分布在数百个 tablet server 上，并包含驻留在内存中的列族。
+
+### 8.3 Personalized Search
+
+个性化搜索（[www.google.com/psearch）是一项用户自愿加入的服务，用于记录用户在](http://www.google.com/psearch）是一项用户自愿加入的服务，用于记录用户在) Google 多种产品（如网页搜索、图片和新闻）中的查询和点击行为。用户可以浏览自己的搜索历史，以重新访问过去的查询和点击记录，并且可以基于其历史上的 Google 使用模式请求个性化的搜索结果。
+
+个性化搜索将每个用户的数据存储在 Bigtable 中。每个用户都有一个唯一的 userid，并被分配到一行，其行名即为该 userid。所有用户行为都存储在一张表中。每一种行为类型都保留一个独立的列族（例如，有一个列族用于存储所有网页查询）。每个数据元素使用其对应用户行为发生的时间作为 Bigtable 的时间戳。个性化搜索通过在 Bigtable 之上运行的 MapReduce 生成用户画像，这些用户画像被用于对在线搜索结果进行个性化处理。
+
+个性化搜索数据在多个 Bigtable 集群之间进行复制，以提高可用性并减少由于客户端距离带来的访问延迟。个性化搜索团队最初在 Bigtable 之上构建了一个客户端侧复制机制，以保证所有副本的最终一致性。当前系统则使用内建于服务器中的复制子系统。
+
+个性化搜索存储系统的设计允许其他团队在各自的列中添加新的按用户维度的信息，目前该系统已被许多其他 Google 产品使用，用于存储按用户划分的配置选项和设置。在多团队共享一张表的情况下，产生了异常大量的列族。为支持这种共享使用方式，我们在 Bigtable 中增加了一种简单的配额机制，用于限制任一特定客户端在共享表中的存储消耗；该机制在使用该系统进行按用户信息存储的不同产品团队之间提供了一定程度的隔离。
+
+## 9 Lessons
+
+在设计、实现、维护和支持 Bigtable 的过程中，我们获得了宝贵的经验，并学到了一些有趣的教训。
+
+一个教训是，大型分布式系统容易受到多种类型的故障影响，而不仅仅是许多分布式协议中假设的标准网络分区和停机故障。例如，我们遇到过以下各种原因导致的问题：内存和网络损坏、严重的时钟偏差、机器挂起、长期且不对称的网络分区、我们使用的其他系统中的 bug（例如 Chubby）、GFS 配额溢出，以及计划内或计划外的硬件维护。随着对这些问题经验的积累，我们通过修改各种协议来加以应对。例如，我们在 RPC 机制中加入了校验和。同时，我们还通过消除系统中各部分之间的假设来处理部分问题。例如，我们不再假设某个 Chubby 操作只能返回固定集合中的某个错误。
+
+另一个教训是，在明确新特性将如何被使用之前，延迟添加新特性非常重要。例如，我们最初计划在 API 中支持通用事务。然而，由于当时并没有立即的使用需求，我们并未实现它们。随着越来越多的实际应用运行在 Bigtable 上，我们得以分析它们的实际需求，并发现大多数应用只需要单行事务。当用户请求分布式事务时，最重要的用途是维护二级索引，我们计划添加一种专门机制来满足这一需求。该新机制虽然不如分布式事务通用，但在效率上会更高（尤其是针对跨数百行甚至更多的更新），并且与我们的乐观跨数据中心复制方案的交互也会更好。
+
+从支持 Bigtable 的实践中我们学到的另一个经验是，适当的系统级监控非常重要（即同时监控 Bigtable 本身以及使用 Bigtable 的客户端进程）。例如，我们扩展了 RPC 系统，使其对部分 RPC 保留详细的关键操作跟踪。该功能帮助我们发现并解决了许多问题，如对 tablet 数据结构的锁争用、提交 Bigtable 变更时写入 GFS 变慢、以及 METADATA tablet 不可用时对 METADATA 表的访问卡住。另一个有用的监控例子是，每个 Bigtable 集群都会在 Chubby 中注册。这使我们能够追踪所有集群，了解它们的规模、运行的软件版本、接收的流量量，以及是否存在如意外高延迟等问题。
+
+我们学到的最重要的教训是：简单设计的价值。考虑到系统的规模（约 100,000 行非测试代码）以及代码会以意想不到的方式随时间演化，我们发现代码和设计的清晰性在代码维护和调试中极为重要。一个例子是我们的 tablet-server 成员协议。我们最初的协议非常简单：master 定期向 tablet server 发放租约，如果租约过期，tablet server 就自我终止。然而，这一协议在网络问题存在时显著降低了可用性，并且对 master 的恢复时间非常敏感。我们对协议进行了多次重新设计，直到得到了性能良好的协议。然而，最终的协议过于复杂，并依赖于 Chubby 中一些很少被其他应用使用的功能。我们发现自己在调试一些晦涩的边界情况上花费了大量时间，不仅是在 Bigtable 代码中，也包括在 Chubby 代码中。最终，我们放弃了该协议，转而采用一个更简单的新协议，该协议仅依赖广泛使用的 Chubby 功能。
+
+## 10 Related Work
+
+Boxwood 项目 [24] 的组件在某些方面与 Chubby、GFS 和 Bigtable 存在重叠，因为它提供分布式一致性、锁机制、分布式块存储以及分布式 B 树存储。在每一个重叠的情况下，Boxwood 的组件似乎针对的层次略低于相应的 Google 服务。Boxwood 项目的目标是为构建更高层次的服务（如文件系统或数据库）提供基础设施，而 Bigtable 的目标是直接支持希望存储数据的客户端应用程序。
+
+许多近期项目也致力于在广域网环境下提供分布式存储或更高层次的服务，通常面向“互联网规模”。这包括分布式哈希表的研究工作，起始于 CAN [29]、Chord [32]、Tapestry [37] 和 Pastry [30] 等项目。这些系统解决了一些 Bigtable 不涉及的问题，例如高度可变的带宽、不受信任的参与者或频繁的重新配置；去中心化控制和拜占庭容错并非 Bigtable 的目标。
+
+就可以提供给应用开发者的分布式数据存储模型而言，我们认为分布式 B 树或分布式哈希表提供的键值对模型过于局限。键值对是一个有用的构建模块，但不应是唯一提供给开发者的构建模块。我们选择的模型比简单的键值对更丰富，支持稀疏的半结构化数据。然而，该模型仍然足够简单，使其可以高效地以扁平文件表示，并且通过 locality group 机制对用户足够透明，从而允许用户调优系统的重要行为。
+
+若干数据库厂商开发了可存储大量数据的并行数据库。Oracle 的 Real Application Cluster 数据库 [27] 使用共享磁盘存储数据（Bigtable 使用 GFS）并使用分布式锁管理器（Bigtable 使用 Chubby）。IBM 的 DB2 Parallel Edition [4] 基于类似于 Bigtable 的共享无关（shared-nothing）架构。每个 DB2 服务器负责表中一部分行，并将其存储在本地关系数据库中。这两个产品均提供完整的关系模型和事务支持。
+
+Bigtable 的 locality group 实现了与其他使用列式而非行式存储组织磁盘数据的系统类似的压缩和磁盘读取性能优势，包括 C-Store [1, 34] 以及商业产品如 Sybase IQ [15, 36]、SenSage [31]、KDB+ [22] 和 MonetDB/X100 中的 ColumnBM 存储层 [38]。另一种将数据进行纵向和横向划分为扁平文件，并实现良好数据压缩比的系统是 AT&T 的 Daytona 数据库 [19]。locality group 不支持 CPU 缓存级别的优化，例如 Ailamaki [2] 所描述的优化。
+
+Bigtable 使用 memtable 和 SSTable 存储 tablet 更新的方式类似于日志结构合并树（Log-Structured Merge Tree）[26] 存储索引数据更新的方式。在两种系统中，排序数据先缓存在内存中，然后写入磁盘，并且读取时必须合并来自内存和磁盘的数据。
+
+C-Store 和 Bigtable 具有许多共同特性：两者均采用共享无关（shared-nothing）架构，并且都有两种不同的数据结构——一种用于最近写入的数据，另一种用于存储长期数据，并且都有将数据从一种形式移动到另一种形式的机制。两者在 API 上存在显著差异：C-Store 的行为类似关系数据库，而 Bigtable 提供了更底层的读写接口，并设计为支持每个服务器每秒数千次此类操作。C-Store 还是“读优化型关系数据库管理系统”，而 Bigtable 在读密集型和写密集型应用上均能提供良好性能。
+
+Bigtable 的负载均衡器需要解决一些与共享无关数据库（例如 [11, 35]）面临的相似负载和内存平衡问题。我们的情况相对简单一些：(1) 我们不考虑相同数据的多份拷贝（可能因视图或索引以不同形式存在）；(2) 我们允许用户指定哪些数据应存于内存、哪些数据应保留在磁盘，而不是动态决定；(3) 我们没有需要执行或优化的复杂查询。
+
+## 11 Conclusions
+
+我们已经描述了 Bigtable，这是 Google 用于存储结构化数据的分布式系统。Bigtable 集群自 2005 年 4 月起投入生产使用，在此之前我们大约花费了七人年用于设计和实现。截至 2006 年 8 月，已有六十多个项目在使用 Bigtable。我们的用户喜欢 Bigtable 提供的高性能和高可用性，并且能够根据资源需求的变化，通过简单地向系统添加更多机器来扩展集群容量。
+
+鉴于 Bigtable 的非同寻常接口，一个有趣的问题是用户适应使用它的难度如何。新用户有时不确定如何最佳使用 Bigtable 接口，尤其是当他们习惯于使用支持通用事务的关系数据库时。尽管如此，许多 Google 产品能够成功使用 Bigtable，证明了我们的设计在实践中运行良好。
+
+我们正在实现多个额外的 Bigtable 功能，例如对二级索引的支持，以及用于构建具有多个主副本的跨数据中心复制 Bigtable 的基础设施。我们还开始将 Bigtable 作为服务部署给各产品组，使得各组不必维护自己的集群。随着服务集群的扩展，我们需要在 Bigtable 内部处理更多的资源共享问题 [3, 5]。
+
+最后，我们发现，在 Google 内部构建自己的存储解决方案具有显著优势。设计 Bigtable 自身的数据模型为我们提供了相当大的灵活性。此外，我们对 Bigtable 的实现以及其所依赖的其他 Google 基础设施的控制，使我们能够在瓶颈和低效出现时及时消除它们。
+
+## Acknowledgements
+
+我们感谢匿名审稿人、David Nagle 以及我们的 shepherd Brad Calder 对本文的反馈。Bigtable 系统从 Google 内部众多用户的反馈中受益良多。此外，我们还感谢以下人员对 Bigtable 的贡献：Dan Aguayo、Sameer Ajmani、Zhifeng Chen、Bill Coughran、Mike Epstein、Healfdene Goguen、Robert Griesemer、Jeremy Hylton、Josh Hyman、Alex Khesin、Joanna Kulik、Alberto Lerner、Sherry Listgarten、Mike Maloney、Eduardo Pinheiro、Kathy Polizzi、Frank Yellin 以及 Arthur Zwiegincew。
+
+> 总结：
+
+> Bigtable 是 Google 提出的一种分布式、高度可扩展(自动分片)的列式存储系统，用于管理 PB 级别的稀疏表数据，支持单行原子操作、多版本存储，并可与 MapReduce 等大规模计算框架结合进行高效分析。
+
+> 能够支撑百万级别随机读写 IOPS，并且伸缩到上千台服务器，可以随时加减服务器，数据的分片会自动根据负载调整
 
 > [论文链接](https://static.googleusercontent.com/media/research.google.com/zh-CN//archive/bigtable-osdi06.pdf)
